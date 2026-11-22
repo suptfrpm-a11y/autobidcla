@@ -1,0 +1,54 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdminOrStaff() {
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role in ['admin', 'moderator', 'manager', 'staff', 'supervisor', 'support']
+      );
+    }
+
+    function isValidImageUpload() {
+      return request.resource != null
+        && request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    // Vehicle listing photos: public read for marketplace feed, owner-scoped write
+    match /vehicles/{userId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isOwner(userId) && isValidImageUpload();
+    }
+
+    // Marketing banners: public read, admin/staff write
+    match /banners/{userId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdminOrStaff() && isValidImageUpload();
+    }
+
+    // User avatars: signed-in read, owner-scoped write
+    match /avatars/{userId}/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(userId) && isValidImageUpload();
+    }
+
+    // KYC verification documents: STRICTLY owner and authorized staff/admin only
+    match /kyc/{userId}/{allPaths=**} {
+      allow read: if isOwner(userId) || isAdminOrStaff();
+      allow write: if isOwner(userId) && isValidImageUpload();
+    }
+
+    // Deny all other storage paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,345 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isAuthenticated() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'microsoft.com'
+      );
+    }
+
+    function getUserData() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data
+        : {};
+    }
+
+    function isBootstrapAdminEmail() {
+      return isEmailVerified() && request.auth.token.email == 'mmwajnnd@gmail.com';
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'admin' ||
+        isBootstrapAdminEmail() ||
+        getUserData().get('role', 'user') == 'admin'
+      );
+    }
+
+    function isFinance() {
+      return isAuthenticated() && (
+        isAdmin() ||
+        request.auth.token.role in ['finance', 'accountant'] ||
+        getUserData().get('role', 'user') in ['finance', 'accountant']
+      );
+    }
+
+    function isStaff() {
+      return isAuthenticated() && (
+        isAdmin() ||
+        isFinance() ||
+        request.auth.token.role in ['support', 'employee', 'staff', 'moderator', 'manager', 'supervisor'] ||
+        getUserData().get('role', 'user') in ['support', 'employee', 'staff', 'moderator', 'manager', 'supervisor']
+      );
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Users collection (public profile fields only; private PII/wallet live in user_private)
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId)
+        && (!('role' in request.resource.data) || request.resource.data.role == 'user' || (request.resource.data.role == 'admin' && isBootstrapAdminEmail()))
+        && (!('deposits' in request.resource.data) || request.resource.data.deposits == 0)
+        && (!('isVerified' in request.resource.data) || request.resource.data.isVerified == false)
+        && (!('hasStockInsightsAccess' in request.resource.data) || request.resource.data.hasStockInsightsAccess == false)
+        && (!('isRevoked' in request.resource.data) || request.resource.data.isRevoked == false)
+        && !request.resource.data.keys().hasAny([
+          'panNumber', 'nationalIdNumber', 'idDocumentType', 'phoneNumber',
+          'phoneVerified', 'phoneVerifiedAt', 'email'
+        ]);
+      allow update: if isAdmin()
+        || (isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['followers', 'followersIds']))
+        || (isOwner(userId)
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              'role', 'deposits', 'isVerified', 'hasStockInsightsAccess',
+              'stockInsightsUnlockedAt', 'suspensionStatus', 'suspensionReason',
+              'suspensionUntil', 'isRevoked', 'sessionRevokedAt', 'totalCommissionPaid',
+              'isDeleted', 'deletedAt', 'panNumber', 'nationalIdNumber', 'idDocumentType',
+              'phoneNumber', 'phoneVerified', 'phoneVerifiedAt', 'email'
+            ])
+            && (
+              !request.resource.data.diff(resource.data).affectedKeys().hasAny(['verificationStatus']) ||
+              request.resource.data.verificationStatus == 'pending'
+            ));
+      allow delete: if isAdmin();
+    }
+
+    // Private user PII, verification numbers, suspension flags & server-written wallet deposits
+    match /user_private/{userId} {
+      allow read: if isOwner(userId) || isStaff();
+      allow create: if isOwner(userId)
+        && (!('deposits' in request.resource.data) || request.resource.data.deposits == 0)
+        && (!('suspensionStatus' in request.resource.data) || request.resource.data.suspensionStatus == 'none')
+        && (!('isDeleted' in request.resource.data) || request.resource.data.isDeleted == false)
+        && (!('isRevoked' in request.resource.data) || request.resource.data.isRevoked == false)
+        && !request.resource.data.keys().hasAny([
+          'phoneVerified', 'phoneVerifiedAt', 'phoneNumber', 'totalCommissionPaid',
+          'sessionRevokedAt', 'deletedAt'
+        ]);
+      allow update: if isOwner(userId)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'deposits', 'suspensionStatus', 'suspensionReason', 'suspensionUntil',
+          'isRevoked', 'sessionRevokedAt', 'phoneVerified', 'phoneVerifiedAt',
+          'phoneNumber', 'isDeleted', 'deletedAt', 'totalCommissionPaid'
+        ]);
+      allow delete: if false;
+    }
+
+    // Public username reservation map (immutable once claimed)
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if isAuthenticated()
+        && !exists(/databases/$(database)/documents/usernames/$(username))
+        && request.resource.data.uid == request.auth.uid;
+      allow update: if false;
+      allow delete: if isAdmin() || (isAuthenticated() && resource.data.uid == request.auth.uid);
+    }
+
+    // Vehicles catalog: public read, strict field locks on create and owner updates (bids & boosts server-only)
+    match /vehicles/{vehicleId} {
+      allow read: if true;
+      allow create: if isEmailVerified()
+        && request.resource.data.ownerId == request.auth.uid
+        && (!('currentBid' in request.resource.data) || !('startingPrice' in request.resource.data) || request.resource.data.currentBid == request.resource.data.startingPrice)
+        && (!('isBoosted' in request.resource.data) || request.resource.data.isBoosted == false)
+        && !('winningUserId' in request.resource.data)
+        && !('winningBidderId' in request.resource.data)
+        && request.resource.data.status in ['Pending Review', 'Upcoming', 'Live Auction', 'Direct Sale'];
+      allow update: if isEmailVerified() && (
+        isStaff()
+        || (resource.data.ownerId == request.auth.uid
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              'currentBid', 'winningUserId', 'winningUsername', 'winningBidderId',
+              'bidUserIds', 'liveParticipants', 'upcomingBids', 'isBoosted',
+              'boostPlan', 'finalSoldPrice', 'commissionAmount', 'isConcluded',
+              'isBlacklisted', 'isRestricted', 'endTime', 'status'
+            ]))
+      );
+      allow delete: if isAdmin() || (isAuthenticated() && resource.data.ownerId == request.auth.uid);
+
+      // Per-user engagement subcollections (views, likes, wishlist)
+      match /likes/{userId} {
+        allow read: if true;
+        allow create, update, delete: if isOwner(userId);
+      }
+
+      match /wishlist/{userId} {
+        allow read: if true;
+        allow create, update, delete: if isOwner(userId);
+      }
+
+      match /views/{userId} {
+        allow read: if true;
+        allow create, update: if isOwner(userId);
+        allow delete: if false;
+      }
+    }
+
+    // Stock inventory dossiers: staff or verified Stock Insights subscribers / listing owners
+    match /stock/{stockId} {
+      allow read: if isAuthenticated() && (
+        isStaff() ||
+        getUserData().get('hasStockInsightsAccess', false) == true ||
+        resource.data.ownerId == request.auth.uid
+      );
+      allow create, update: if isStaff() || (isAuthenticated() && request.resource.data.ownerId == request.auth.uid);
+      allow delete: if isStaff() || (isAuthenticated() && resource.data.ownerId == request.auth.uid);
+    }
+
+    // Bids ledger: authenticated read, server-only writes via Admin SDK
+    match /bids/{bidId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // Financial transactions ledger: owner/staff read, server-only writes via Admin SDK
+    match /transactions/{transactionId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // Processed payment idempotency records: strictly server-only
+    match /processed_payments/{paymentId} {
+      allow read, write: if false;
+    }
+
+    // Razorpay deposit orders: strictly server-only via Admin SDK
+    match /razorpay_orders/{orderId} {
+      allow read, write: if false;
+    }
+
+    // Platform settings: public non-sensitive UI configs; treasury wallet docs restricted to finance/admin & server-written
+    match /settings/{docId} {
+      allow read: if (docId in ['app_config', 'announcement', 'version_control', 'cookie_policy'])
+        || ((docId in ['company_wallet', 'ct_collection']) ? isFinance() : isStaff());
+      allow write: if !(docId in ['company_wallet', 'ct_collection']) && isAdmin();
+    }
+
+    // CT Collection channel logs: finance/admin read, server-only writes
+    match /ct_collections/{docId} {
+      allow read: if isFinance();
+      allow write: if false;
+    }
+
+    match /content_banners/{bannerId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    match /coupons/{couponId} {
+      allow read: if isAuthenticated();
+      allow write: if isStaff();
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /dealers/{dealerId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    match /moderation_reports/{reportId} {
+      allow read: if isStaff();
+      allow create: if isAuthenticated() && request.resource.data.reporterId == request.auth.uid;
+      allow update, delete: if isStaff();
+    }
+
+    // Contact form submissions: public/guest create with strict schema/size limits, staff read/manage
+    match /contact_inquiries/{inquiryId} {
+      allow create: if request.resource.data.keys().hasOnly([
+          'ticketNumber', 'userId', 'name', 'email', 'phone',
+          'subject', 'message', 'status', 'createdAt', 'serverTimestamp'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 120
+        && request.resource.data.email is string
+        && request.resource.data.email.size() > 0
+        && request.resource.data.email.size() <= 150
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 2000
+        && request.resource.data.status == 'open';
+      allow read, update, delete: if isStaff();
+    }
+
+    // Admin broadcast log history: staff only
+    match /broadcast_history/{docId} {
+      allow read, write: if isStaff();
+    }
+
+    match /sessions/{sessionId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      allow write: if false;
+    }
+
+    match /tickets/{ticketId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow create: if isEmailVerified() && request.resource.data.userId == request.auth.uid;
+      allow update: if isEmailVerified() && isStaff();
+      allow delete: if isStaff();
+    }
+
+    match /support_chats/{chatId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isStaff();
+    }
+
+    match /support_chats/{chatId}/messages/{messageId} {
+      allow read, create: if isAuthenticated() && (
+        isStaff() ||
+        get(/databases/$(database)/documents/support_chats/$(chatId)).data.userId == request.auth.uid
+      );
+      allow update, delete: if isStaff();
+    }
+
+    // Direct user-to-user messaging: participants & staff only (requires verified email for writes)
+    match /direct_chats/{chatId} {
+      allow read: if isAuthenticated() && (isStaff() || request.auth.uid in resource.data.participantIds);
+      allow create: if isEmailVerified() && request.auth.uid in request.resource.data.participantIds;
+      allow update: if isEmailVerified() && request.auth.uid in resource.data.participantIds;
+      allow delete: if isAdmin();
+    }
+
+    match /direct_chats/{chatId}/messages/{messageId} {
+      allow read: if isAuthenticated() && (
+        isStaff() ||
+        request.auth.uid in get(/databases/$(database)/documents/direct_chats/$(chatId)).data.participantIds
+      );
+      allow create: if isEmailVerified()
+        && request.auth.uid in get(/databases/$(database)/documents/direct_chats/$(chatId)).data.participantIds
+        && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.type != 'fund_transfer';
+      allow update: if isEmailVerified()
+        && (resource.data.senderId == request.auth.uid || resource.data.recipientId == request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
+      allow delete: if isAdmin();
+    }
+
+    match /appeals/{appealId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isStaff();
+    }
+
+    // KYC verification submissions: strictly owner and staff/admin only
+    match /verifications/{verificationId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow create, update: if isStaff() || (
+        isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending'
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Notifications: created only by server Admin SDK or staff; users can mark their own as read or delete their own
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow create: if isStaff();
+      allow update: if isStaff() || (
+        isAuthenticated()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt'])
+      );
+      allow delete: if isStaff() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+    }
+
+    // Server-side hashed OTP challenges: never readable/writable from client
+    match /admin_otps/{otpId} {
+      allow read, write: if false;
+    }
+
+    match /ai_chats/{chatId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow write: if isStaff();
+    }
+
+    match /ai_brain_sessions/{sessionId} {
+      allow read, write: if isStaff();
+    }
+  }
+}
